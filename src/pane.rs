@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,16 +18,28 @@ use crate::config::Program;
 use crate::logfile::LogFile;
 use crate::layout::PaneId;
 
-type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+/// PTY へ書き込むスレッドへの送り口．大きな貼り付けをプログラムがすぐ読まなくても，
+/// 画面の描画やキー入力の処理が止まらないように，書き込みは別のスレッドで行う．
+type Writer = Sender<Vec<u8>>;
 
 /// vt100 が扱わない問い合わせ（カーソル位置・端末種別）に応答する．
 /// 応答しないと，fish など起動時に問い合わせるシェルが待たされる．
+///
+/// 過去の出力から捨てられた行の数も数える（選択の位置を絶対行で持つため，select.rs）．
 #[derive(Default)]
 pub struct Replies {
     buf: Vec<u8>,
+    /// 過去の出力がいっぱいになって捨てられた行の数（代替画面の分は数えない）．
+    pub dropped: u64,
 }
 
 impl vt100::Callbacks for Replies {
+    fn on_scroll(&mut self, _contents: vt100::capture::RowContents<'_>, alternate_screen: bool) {
+        if !alternate_screen {
+            self.dropped += 1;
+        }
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
@@ -56,7 +68,7 @@ pub type Parser = vt100::Parser<Replies>;
 
 /// 実行中のプロセスと，その PTY．
 struct Proc {
-    writer: SharedWriter,
+    writer: Writer,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     /// 設定のプログラムとして起動したか（`s: shell` で開いたシェルなら false）．
@@ -181,7 +193,19 @@ impl Pane {
         // slave を閉じておかないと，子が終了しても reader が EOF にならない．
         drop(pair.slave);
 
-        let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let writer: Writer = {
+            let mut out = pair.master.take_writer()?;
+            let (writer, rx) = mpsc::channel::<Vec<u8>>();
+            // 送り口（Proc と読み取りスレッドが持つ）がすべてなくなると終わる
+            thread::spawn(move || {
+                for buf in rx {
+                    if out.write_all(&buf).and_then(|()| out.flush()).is_err() {
+                        break;
+                    }
+                }
+            });
+            writer
+        };
         let mut reader = pair.master.try_clone_reader()?;
         self.generation += 1;
         self.stop_requested = false;
@@ -191,7 +215,7 @@ impl Pane {
         if let Some(command) = typeahead {
             // シェルの準備（最初のプロンプト）を待ってからコマンドを入力する．
             // 早すぎると端末のエコーと二重に表示されてしまう．
-            let writer = Arc::clone(&writer);
+            let writer = writer.clone();
             let got_output = Arc::clone(&got_output);
             thread::spawn(move || {
                 for _ in 0..500 {
@@ -201,9 +225,7 @@ impl Pane {
                     thread::sleep(Duration::from_millis(10));
                 }
                 thread::sleep(Duration::from_millis(150));
-                let mut w = writer.lock().unwrap();
-                let _ = w.write_all(command.as_bytes());
-                let _ = w.flush();
+                let _ = writer.send(command.into_bytes());
             });
         }
 
@@ -216,7 +238,7 @@ impl Pane {
                 log.lock().unwrap().marker(&what);
             }
             let parser = Arc::clone(&self.parser);
-            let writer = Arc::clone(&writer);
+            let writer = writer.clone();
             let got_output = Arc::clone(&got_output);
             let log = self.log.clone();
             thread::spawn(move || {
@@ -236,7 +258,7 @@ impl Pane {
                         log.lock().unwrap().write(&buf[..n]);
                     }
                     if !replies.is_empty() {
-                        let _ = writer.lock().unwrap().write_all(&replies);
+                        let _ = writer.send(replies);
                     }
                     if tx.send(Event::Output).is_err() {
                         return;
@@ -345,9 +367,7 @@ impl Pane {
 
     pub fn write(&mut self, bytes: &[u8]) {
         if let Some(proc) = &self.proc {
-            let mut w = proc.writer.lock().unwrap();
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
+            let _ = proc.writer.send(bytes.to_vec());
         }
     }
 

@@ -1,3 +1,4 @@
+mod clipboard;
 mod config;
 mod deps;
 mod help;
@@ -6,9 +7,11 @@ mod launcher;
 mod layout;
 mod logfile;
 mod mouse;
+mod paste;
 mod pane;
 mod render;
 mod scroll;
+mod select;
 mod session;
 mod ui;
 
@@ -17,7 +20,7 @@ use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -33,6 +36,7 @@ use layout::{Dir, Node, PaneId, Rect};
 use mouse::{Button, Kind as MouseKind, MouseEvent};
 use pane::Pane;
 use render::{Frame, Renderer, Style};
+use select::{Mode as SelectMode, Pos, View};
 
 /// `end` の手前までに収まる分だけ書き，使ったセル数を返す（全角文字は 2 セル）．
 fn put_clipped(frame: &mut Frame, x: u16, y: u16, s: &str, style: Style, end: u16) -> u16 {
@@ -54,7 +58,9 @@ fn put_clipped(frame: &mut Frame, x: u16, y: u16, s: &str, style: Style, end: u1
     cx - x
 }
 
-const MOUSE_HINT: &str = "Mouse: on (Shift+drag to select text, C-q m to turn off)";
+const MOUSE_HINT: &str = "Mouse: on (drag to copy, middle-click or C-q ] to paste, C-q m to turn off)";
+/// 続けてクリックしたとみなす間隔（ダブルクリックで単語，トリプルクリックで行を選ぶ）．
+const MULTI_CLICK: Duration = Duration::from_millis(400);
 
 /// メインループに届くイベント．
 pub enum Event {
@@ -284,6 +290,20 @@ struct App {
     /// ペインを閉じた後も動いている stop のプロセス（終わったら回収する）．
     background: Vec<std::process::Child>,
     mouse_input: mouse::Extractor,
+    /// 貼り付け（ブラケットペースト）をキー入力から切り分ける．
+    paste_input: paste::Splitter,
+    /// 選んでいる文字の範囲（マウスのドラッグかコピーモード）．
+    selection: Option<select::Selection>,
+    /// マウスでドラッグして選んでいる最中か．
+    selecting: bool,
+    /// 直前のクリックの時刻・位置・続けてクリックした回数（1〜3）．
+    last_click: Option<(Instant, u16, u16, u8)>,
+    /// コピーモード（スクロールモード中にキーで動かす）のカーソル．
+    copy_cursor: Option<Pos>,
+    /// shouji の中で最後にコピーした文字列（C-q ] と中クリックで貼り付ける）．
+    clipboard: Option<String>,
+    /// クライアントの端末のクリップボードへ送る文字列．
+    pending_clipboard: Option<String>,
     tx: Sender<Event>,
     quit: bool,
 }
@@ -311,6 +331,13 @@ impl App {
             info: None,
             mouse,
             mouse_input: mouse::Extractor::default(),
+            paste_input: paste::Splitter::default(),
+            selection: None,
+            selecting: false,
+            last_click: None,
+            copy_cursor: None,
+            clipboard: None,
+            pending_clipboard: None,
             waits: HashMap::new(),
             runs: HashMap::new(),
             restarts: HashMap::new(),
@@ -464,14 +491,26 @@ impl App {
     }
 
     fn handle(&mut self, ev: Event) {
+        // 最後のペインが閉じて終わるところ（ウィンドウが無い）．同じときに届いた
+        // 入力などは捨てる（win() が使えない）
+        if self.windows.is_empty() {
+            return;
+        }
         match ev {
             Event::Input(bytes) => {
-                let (keys, events) = self.mouse_input.feed(&bytes);
-                for ev in events {
-                    self.on_mouse(ev);
-                }
-                if !keys.is_empty() {
-                    self.on_keys(&keys);
+                for chunk in self.paste_input.feed(&bytes) {
+                    match chunk {
+                        paste::Chunk::Keys(bytes) => {
+                            let (keys, events) = self.mouse_input.feed(&bytes);
+                            for ev in events {
+                                self.on_mouse(ev);
+                            }
+                            if !keys.is_empty() {
+                                self.on_keys(&keys);
+                            }
+                        }
+                        paste::Chunk::Paste(text) => self.on_paste(&text),
+                    }
                 }
             }
             Event::Output => {}
@@ -501,6 +540,7 @@ impl App {
             self.scroll(bytes);
         } else {
             self.message = None;
+            self.selection = None;
             for action in self.input.feed(bytes) {
                 // C-q d に続けて打ったキー（同時に届いたもの）は，確認への答えにする
                 match action {
@@ -601,19 +641,146 @@ impl App {
             self.message = None;
             self.info = None;
         }
+        if self.selecting {
+            match ev.kind {
+                MouseKind::Drag => return self.drag_to(ev.x, ev.y),
+                MouseKind::Release => return self.finish_selection(),
+                _ => self.selecting = false,
+            }
+        }
         if let Some(c) = click {
+            self.selection = None;
             self.do_click(c);
             return;
         }
-        let _ = (w, h);
 
-        let Some(id) = self.pane_at(ev.x, ev.y) else { return };
+        let Some(id) = self.pane_at(ev.x, ev.y) else {
+            if pressed {
+                self.selection = None;
+            }
+            return;
+        };
         match ev.kind {
-            MouseKind::Press(Button::Left) => self.focus_pane(id),
+            MouseKind::Press(Button::Left) => {
+                self.focus_pane(id);
+                self.start_selection(id, ev.x, ev.y);
+            }
+            MouseKind::Press(Button::Middle) => {
+                self.focus_pane(id);
+                self.paste_clipboard();
+            }
             MouseKind::WheelUp => self.wheel(id, true),
             MouseKind::WheelDown => self.wheel(id, false),
             _ => {}
         }
+    }
+
+    // ---- 選択とコピー・貼り付け ----
+
+    /// ペインの中身を押したところから選び始める．続けて押すと単語・行を選ぶ．
+    fn start_selection(&mut self, id: PaneId, x: u16, y: u16) {
+        self.selection = None;
+        let Some(r) = self.win().rect_of(id).filter(|r| r.contains(x, y)) else { return };
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((t, lx, ly, n)) if (lx, ly) == (x, y) && now.duration_since(t) < MULTI_CLICK => n % 3 + 1,
+            _ => 1,
+        };
+        self.last_click = Some((now, x, y, count));
+        let mode = match count {
+            1 => SelectMode::Char,
+            2 => SelectMode::Word,
+            _ => SelectMode::Line,
+        };
+        let Some(pane) = self.panes.get(&id) else { return };
+        let span = select::span_at(&pane.parser.lock().unwrap(), mode, y - r.y, x - r.x);
+        self.selection = Some(select::Selection::new(id, mode, span));
+        self.selecting = true;
+    }
+
+    /// ドラッグ中: 選択の終わりを動かす．ペインの上下の外へ出たら 1 行ずつスクロールする．
+    fn drag_to(&mut self, x: u16, y: u16) {
+        let Some(mut sel) = self.selection else { return };
+        let Some(r) = self.win().rect_of(sel.pane) else { return };
+        let Some(pane) = self.panes.get(&sel.pane) else { return };
+        let mut parser = pane.parser.lock().unwrap();
+        let screen = parser.screen_mut();
+        let offset = screen.scrollback();
+        let row = if y < r.y {
+            screen.set_scrollback(offset + 1);
+            0
+        } else if y >= r.y + r.h {
+            screen.set_scrollback(offset.saturating_sub(1));
+            r.h.saturating_sub(1)
+        } else {
+            y - r.y
+        };
+        let col = x.clamp(r.x, r.x + r.w.saturating_sub(1)) - r.x;
+        let scrolled = screen.scrollback() > 0;
+        sel.set_head(select::span_at(&parser, sel.mode, row, col));
+        drop(parser);
+        self.selection = Some(sel);
+        if sel.pane == self.win().active && !self.scrolling && scrolled {
+            self.scrolling = true;
+        }
+    }
+
+    /// ボタンを離した: 何か選んでいればコピーする（表示は次の操作まで残す）．
+    fn finish_selection(&mut self) {
+        self.selecting = false;
+        match self.selection {
+            Some(sel) if !sel.is_click() => self.copy_selection(),
+            _ => self.selection = None,
+        }
+    }
+
+    /// 選んでいる文字列をクリップボードへ入れる．
+    fn copy_selection(&mut self) {
+        let Some(sel) = self.selection else { return };
+        let Some(pane) = self.panes.get(&sel.pane) else { return };
+        let text = select::text(&mut pane.parser.lock().unwrap(), &sel);
+        if text.is_empty() {
+            return;
+        }
+        let n = text.chars().count();
+        self.info = Some(format!("Copied {n} character{} (C-q ] to paste)", if n == 1 { "" } else { "s" }));
+        self.pending_clipboard = Some(text.clone());
+        self.clipboard = Some(text);
+    }
+
+    /// 端末から貼り付けられた: キーとして解釈せず，そのまま選択中のペインへ送る．
+    fn on_paste(&mut self, text: &[u8]) {
+        if self.help.is_some() || self.launcher.is_some() || self.confirm_quit {
+            return;
+        }
+        self.info = None;
+        self.message = None;
+        self.input = InputParser::default();
+        self.stop_scrolling();
+        self.selection = None;
+        self.paste_to_active(text);
+    }
+
+    /// shouji の中でコピーした文字列を貼り付ける（C-q ] と中クリック）．
+    fn paste_clipboard(&mut self) {
+        let Some(text) = self.clipboard.clone() else {
+            self.info = Some("Nothing copied yet (drag over text or use C-q [ then v / y)".into());
+            return;
+        };
+        self.stop_scrolling();
+        self.selection = None;
+        self.paste_to_active(&paste::from_text(&text));
+    }
+
+    fn paste_to_active(&mut self, text: &[u8]) {
+        let active = self.win().active;
+        let Some(p) = self.panes.get_mut(&active) else { return };
+        if p.is_dead() || self.waits.contains_key(&active) {
+            self.info = Some("Not pasted: the program is not running".into());
+            return;
+        }
+        let bracketed = p.parser.lock().unwrap().screen().bracketed_paste();
+        p.write(&paste::wrap(text, bracketed));
     }
 
     /// 表示中のウィンドウで (x, y) にあるペイン．
@@ -630,6 +797,7 @@ impl App {
             }
             self.scrolling = false;
         }
+        self.copy_cursor = None;
     }
 
     fn focus_pane(&mut self, id: PaneId) {
@@ -672,8 +840,8 @@ impl App {
         let cmd = if up { scroll::ScrollCmd::Up(LINES) } else { scroll::ScrollCmd::Down(LINES) };
         let next = scroll::apply(screen.scrollback(), &cmd, page, screen.scrollback_len());
         screen.set_scrollback(next);
-        // 一番下まで戻ったらスクロールモードを抜ける
-        self.scrolling = next > 0;
+        // 一番下まで戻ったらスクロールモードを抜ける（コピーモードのカーソルがあれば続ける）
+        self.scrolling = next > 0 || self.copy_cursor.is_some();
     }
 
     fn do_click(&mut self, click: Click) {
@@ -792,6 +960,7 @@ impl App {
                 self.close_pane(active);
             }
             Action::ScrollMode => self.scrolling = true,
+            Action::Paste => self.paste_clipboard(),
             Action::ToggleMouse => {
                 self.mouse = !self.mouse;
                 self.info = Some(if self.mouse { MOUSE_HINT.into() } else { "Mouse: off (C-q m to turn on)".into() });
@@ -973,23 +1142,70 @@ impl App {
         }
     }
 
-    /// スクロールモードのキー入力を処理する．
+    /// スクロールモード（コピーモード）のキー入力を処理する．
+    /// 移動するとカーソルが出て，v で選び始め，y か Enter でコピーして抜ける．
     fn scroll(&mut self, bytes: &[u8]) {
         let active = self.win().active;
         let page = self.win().rect_of(active).map_or(1, |r| r.h as usize);
         let Some(pane) = self.panes.get(&active) else {
             self.scrolling = false;
+            self.copy_cursor = None;
             return;
         };
         let mut parser = pane.parser.lock().unwrap();
-        let screen = parser.screen_mut();
+        // カーソルが無ければ，ペインのカーソルと同じ画面上の位置に出す
+        let initial = |parser: &pane::Parser| {
+            let view = View::of(parser);
+            let (r, c) = parser.screen().cursor_position();
+            Pos { row: view.abs(r.min(view.rows.saturating_sub(1))), col: c.min(view.cols.saturating_sub(1)) }
+        };
+        let mut copy = false;
+        let mut exit = false;
         for cmd in scroll::parse(bytes) {
-            let max = screen.scrollback_len();
-            let next = scroll::apply(screen.scrollback(), &cmd, page, max);
-            screen.set_scrollback(next);
-            if cmd == scroll::ScrollCmd::Exit {
-                self.scrolling = false;
+            match cmd {
+                scroll::ScrollCmd::Exit => {
+                    exit = true;
+                    break;
+                }
+                scroll::ScrollCmd::Copy => {
+                    copy = self.selection.is_some_and(|s| s.pane == active);
+                    exit = true;
+                    break;
+                }
+                scroll::ScrollCmd::BeginSelect | scroll::ScrollCmd::LineSelect => {
+                    let cur = *self.copy_cursor.get_or_insert_with(|| initial(&parser));
+                    let mode = if cmd == scroll::ScrollCmd::LineSelect { SelectMode::Line } else { SelectMode::Char };
+                    let span = if mode == SelectMode::Line { select::line_span(cur.row) } else { select::char_span(cur) };
+                    // 同じ選び方をもう一度押したら選択をやめる
+                    self.selection = match self.selection {
+                        Some(s) if s.pane == active && s.mode == mode => None,
+                        _ => Some(select::Selection::new(active, mode, span)),
+                    };
+                }
+                cmd => {
+                    let cur = *self.copy_cursor.get_or_insert_with(|| initial(&parser));
+                    let view = View::of(&parser);
+                    // カーソルの行は常に表示されている
+                    let cells = view.visible(cur.row).map(|r| select::row_cells(&parser, r)).unwrap_or_default();
+                    let (next, offset) = select::step(cur, &cmd, &view, page, &cells);
+                    parser.screen_mut().set_scrollback(offset);
+                    self.copy_cursor = Some(next);
+                    if let Some(sel) = self.selection.as_mut().filter(|s| s.pane == active) {
+                        sel.set_head(match sel.mode {
+                            SelectMode::Line => select::line_span(next.row),
+                            _ => select::char_span(next),
+                        });
+                    }
+                }
             }
+        }
+        drop(parser);
+        if copy {
+            self.copy_selection();
+        }
+        if exit {
+            self.selection = None;
+            self.stop_scrolling();
         }
     }
 
@@ -1345,6 +1561,13 @@ fn run_server(name: &str, size: (u16, u16), opts: &Opts) -> Result<()> {
                 client = None;
             }
         }
+        // コピーした文字列は，接続中の端末のクリップボードへ（クライアントが OSC 52 で書く）
+        if let Some(text) = app.pending_clipboard.take()
+            && let Some(c) = &mut client
+            && session::write_frame(&mut c.stream, session::CLIPBOARD, text.as_bytes()).is_err()
+        {
+            client = None;
+        }
 
         // delay の待ちがあれば，その時刻までにイベントがなくても起き上がる
         let ev = match app.next_deadline() {
@@ -1376,7 +1599,10 @@ fn run_server(name: &str, size: (u16, u16), opts: &Opts) -> Result<()> {
     }
 
     // stop を実行して待つ間，接続中の端末には「Stopping」と出しておく
-    if let Some(c) = &mut client {
+    // （最後のペインが閉じて終わるときはウィンドウが無いので描けない）
+    if let Some(c) = &mut client
+        && !app.windows.is_empty()
+    {
         app.info = Some("Stopping the programs...".into());
         app.confirm_quit = false;
         let (frame, cursor, modes) = app.compose();

@@ -149,7 +149,8 @@ start with `Ctrl-q`: press `Ctrl-q`, let go, then press the key.
 | `C-q q` | Close the pane |
 | `C-q s` | Run the program's `stop` command without closing the pane (also the `Stop` button) |
 | `C-q c` / `C-q n` / `C-q p` / `C-q 1-9` | New window / switch windows (or click a tab) |
-| `C-q [` | Scroll back (`k/j u/d g/G`, `q` to stop; the mouse wheel works too) |
+| `C-q [` | Scroll back (`k/j u/d g/G`, `q` to stop; the mouse wheel works too) and copy (see below) |
+| `C-q ]` | Paste what you copied in shouji (also the middle mouse button) |
 | `C-q t` | Show / hide the layout panel |
 | `C-q m` | Mouse on / off |
 | `C-q d` | Leave: detach (programs keep running) or quit |
@@ -158,4 +159,20 @@ start with `Ctrl-q`: press `Ctrl-q`, let go, then press the key.
 In a pane whose program has stopped, press `r` to run it again, `s` for a shell, or `q` to close it.
 In a pane waiting to start, press `Enter` to start it now.
 Each pane title shows the program's state (`Running`, `Waiting`, `Stopped`, `Finished`, `Shell`).
-While the mouse is on, select text with `Shift`+drag. Colors need a terminal with 24-bit color.
+Colors need a terminal with 24-bit color.
+
+### Copy and paste
+
+- **Mouse**: drag over text in a pane to copy it (double-click: a word, triple-click: a line).
+  Only that pane is selected; drag past its top or bottom edge to scroll.
+  `Shift`+drag still uses your terminal's own selection.
+- **Keyboard**: `C-q [`, move with `h/j/k/l`, `w/b`, `0/$`, `u/d`, `g/G`, press `v` (or `V` for whole lines)
+  to start selecting, then `y` or `Enter` to copy. `q` / `Esc` cancels.
+- Copied text goes to your terminal's clipboard with OSC 52, so it also works over SSH and after
+  detach / attach. Terminals that support it: kitty, WezTerm, iTerm2, Windows Terminal, foot, Alacritty
+  (xterm needs `allowWindowOps`; inside tmux, set `allow-passthrough on`).
+  For terminals that ignore OSC 52 (GNOME Terminal and other VTE terminals), shouji also passes it to
+  `wl-copy`, `xclip` or `xsel` if one is installed (`sudo apt install xclip`), or to the command in
+  `SHOUJI_COPY_COMMAND`. You can always paste it inside shouji with `C-q ]` or the middle button.
+- **Paste** with your terminal as usual. Pasted text always goes to the program as it is, even if it
+  contains `Ctrl-q`, and it ends scroll mode first.

@@ -110,6 +110,10 @@ fn to_event([code, x, y]: [u32; 3], pressed: bool) -> Option<MouseEvent> {
     let x = (x.max(1) - 1).min(u16::MAX as u32) as u16;
     let y = (y.max(1) - 1).min(u16::MAX as u32) as u16;
     let motion = code & 32 != 0;
+    // Shift を押しながらの操作は外側の端末の選択に任せる（届いても無視する）
+    if code & 4 != 0 {
+        return None;
+    }
     let kind = if code & 64 != 0 {
         match code & 3 {
             0 => Kind::WheelUp,
@@ -163,6 +167,13 @@ mod tests {
         let (rest, events) = e.feed(b"2;3M");
         assert!(rest.is_empty());
         assert_eq!(events, vec![ev(Kind::Press(Button::Left), 11, 2)]);
+    }
+
+    #[test]
+    fn shift_is_ignored() {
+        let mut e = Extractor::default();
+        let (rest, events) = e.feed(b"\x1b[<4;1;1M\x1b[<36;2;1M");
+        assert!(rest.is_empty() && events.is_empty());
     }
 
     #[test]

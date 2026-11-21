@@ -38,6 +38,8 @@ pub enum Action {
     ToggleSidebar,
     /// 選択中のプログラムの stop を実行する（ペインは閉じない）．
     Stop,
+    /// shouji の中で最後にコピーした文字列を貼り付ける．
+    Paste,
 }
 
 #[derive(Default)]
@@ -81,6 +83,7 @@ impl InputParser {
                     b'd' => actions.push(Action::Quit),
                     b'c' => actions.push(Action::NewWindow),
                     b'[' => actions.push(Action::ScrollMode),
+                    b']' => actions.push(Action::Paste),
                     b'm' => actions.push(Action::ToggleMouse),
                     b'?' => actions.push(Action::Help),
                     b'z' => actions.push(Action::Zoom),
@@ -147,6 +150,7 @@ mod tests {
         assert_eq!(p.feed(b"a\x07"), vec![Action::Forward(b"a\x07".to_vec())]);
         assert_eq!(p.feed(b"\x11z\x11t"), vec![Action::Zoom, Action::ToggleSidebar]);
         assert_eq!(p.feed(b"\x111\x110"), vec![Action::SelectWindow(0), Action::SelectWindow(9)]);
+        assert_eq!(p.feed(b"\x11[\x11]"), vec![Action::ScrollMode, Action::Paste]);
     }
 
     #[test]
