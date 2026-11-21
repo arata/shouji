@@ -1,0 +1,35 @@
+# if_env と commands の例: 環境変数の値で，起動するプログラムやコマンドを変える．
+#   shouji -t sample_config/if_env.yaml                      既定値で起動（viewer は出ない）
+#   VIEWER=1 PLANNER=fast shouji -t sample_config/if_env.yaml
+# 条件は，タスクを起動するときに 1 回だけ調べる（env の既定値を展開した後の値を見る）．
+name: if-env
+
+env:
+  VIEWER: ${VIEWER:-0}
+  PLANNER: ${PLANNER:-normal}
+
+programs:
+  - name: server
+    command: echo "server (VIEWER=$VIEWER PLANNER=$PLANNER)"; sleep 600
+
+  # VIEWER=1 のときだけ起動する．合わなければペインを作らない
+  - name: viewer
+    if_env: { VIEWER: 1 }
+    command: echo "viewer"; sleep 600
+
+  # 上から見て，最初に if_env が合った項目を実行する（1 つだけ）．
+  # 値は並びでもよく（どれかに合えばよい），* と ? が使える．if_env のない項目は「それ以外」
+  - name: planner
+    after: [viewer, server]          # 外れた viewer は待たない
+    commands:
+      - if_env: { PLANNER: [fast, "quick*"] }
+        command: echo "planner --fast"; sleep 600
+        stop: echo "stop fast planner"
+      - if_env: { PLANNER: normal }
+        command: echo "planner"; sleep 600
+      - command: echo "unknown PLANNER=$PLANNER"; exit 1
+
+  # 変数を 2 つ書くと，両方とも合ったときだけ
+  - name: debug
+    if_env: { VIEWER: 1, PLANNER: "?*" }     # ?* は「空でない」，"" は「空か未設定」
+    command: echo "debug"; sleep 600

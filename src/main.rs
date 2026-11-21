@@ -372,7 +372,12 @@ impl App {
     }
 
     /// タスクの各プログラムを，新しいウィンドウを均等に分割したペインで起動する．
-    fn open_task(&mut self, task: Task) -> Result<()> {
+    fn open_task(&mut self, mut task: Task) -> Result<()> {
+        // if_env に合わないプログラムは，ペインを作らない
+        let skipped = task.apply_conditions()?;
+        if task.windows.is_empty() {
+            bail!("nothing to start in {}: if_env does not match for {}", task.name, skipped.join(", "));
+        }
         // after は別のウィンドウのプログラムも指せるので，先にタスク全体のペイン番号を決める
         let ids: Vec<PaneId> = (self.next_id..self.next_id + task.programs.len()).collect();
         self.next_id += ids.len();
@@ -424,8 +429,15 @@ impl App {
         };
         // 表示するのはタスクの最初のウィンドウ
         self.current = first;
+        let mut notes = Vec::new();
         if !failed.is_empty() {
-            self.message = Some(format!("failed to start: {}", failed.join(", ")));
+            notes.push(format!("failed to start: {}", failed.join(", ")));
+        }
+        if !skipped.is_empty() {
+            notes.push(format!("not started (if_env): {}", skipped.join(", ")));
+        }
+        if !notes.is_empty() {
+            self.message = Some(notes.join(" / "));
         }
         Ok(())
     }

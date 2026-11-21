@@ -106,7 +106,32 @@ programs:
     command: roscore
 ```
 
-Every option is described in `sample_config/task.yaml`. `sample_config/ros.yaml` is a ROS example.
+`if_env` starts a program only when environment variables have the given values; otherwise no pane is made.
+`commands` picks one command: the first item whose `if_env` matches (an item without `if_env` is the fallback).
+
+```yaml
+env:
+  VIEWER: ${VIEWER:-0}
+  PLANNER: ${PLANNER:-normal}
+programs:
+  - name: viewer
+    if_env: { VIEWER: 1 }            # every variable listed must match
+    command: ./viewer
+  - name: planner
+    commands:
+      - if_env: { PLANNER: [fast, "quick*"] }   # any value in the list; * and ? are wildcards
+        command: ./planner --fast
+        stop: ./planner --shutdown   # optional: replaces the program's stop when this item is picked
+      - command: ./planner           # fallback; without it, no match means no pane
+```
+
+The conditions are checked once, when the task is launched, against the environment after `env` is expanded
+(so `VIEWER=1 shouji -t task.yaml` works, and so do the defaults). An unset variable counts as empty:
+`""` matches empty, `"?*"` matches anything else. `pre_command` is not run for the check.
+A program left out is treated like one not selected: an `after` that waits for it is dropped.
+
+Every option is described in `sample_config/task.yaml`. `sample_config/ros.yaml` is a ROS example,
+`sample_config/if_env.yaml` an `if_env` / `commands` example.
 
 ## Keys (prefix: `Ctrl-q`)
 

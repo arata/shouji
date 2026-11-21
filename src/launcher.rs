@@ -102,8 +102,7 @@ impl Selection {
             items.push((Item::Window(w.programs.clone()), w.name.clone()));
             for &k in &w.programs {
                 let p = &task.programs[k];
-                let command = p.command.split_whitespace().collect::<Vec<_>>().join(" ");
-                items.push((Item::Program(k), format!("{:<12} {command}", p.name)));
+                items.push((Item::Program(k), format!("{:<12} {}", p.name, p.summary())));
             }
         }
         let checked = vec![true; task.programs.len()];
@@ -493,6 +492,8 @@ mod tests {
         Program {
             name: name.into(),
             command: format!("run {name}"),
+            if_env: Vec::new(),
+            choices: Vec::new(),
             pre_command: None,
             cwd: None,
             env: Vec::new(),

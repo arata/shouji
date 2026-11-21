@@ -41,6 +41,14 @@
 //!     delay: 2                  # さらに 2 秒待ってから起動
 //!   - name: top
 //!     command: top
+//!   - name: viewer
+//!     if_env: { VIEWER: "1" }   # 環境変数がこの値のときだけ起動する（合わなければペインを作らない）
+//!     command: ./viewer
+//!   - name: planner
+//!     commands:                 # 上から見て，最初に if_env が合ったものを実行する
+//!       - if_env: { PLANNER: [fast, "quick*"] }
+//!         command: ./planner --fast
+//!       - command: ./planner    # if_env のない項目は「それ以外」
 //! ```
 
 use std::collections::BTreeMap;
@@ -103,6 +111,108 @@ fn ordered_env<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Env, D::Error> 
         }
     }
     d.deserialize_any(V)
+}
+
+/// `if_env` の条件: 変数名と，値のパターンの並び．書いた変数のすべてが，それぞれのパターンの
+/// どれかに合えば成り立つ．パターンは `*`（0 文字以上）と `?`（1 文字）が使える．
+pub type IfEnv = Vec<(String, Vec<String>)>;
+
+/// `if_env:` のマップを読む．値は 1 つのパターンか，パターンの並び．
+/// `RVIZ: 1` のような数値や真偽値も，文字列として読む．
+fn if_env<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<IfEnv>, D::Error> {
+    use serde::de::Error;
+    use serde_yaml_ng::Value;
+    const EXPECTING: &str = "if_env must be a map of NAME: value (or NAME: [value, ...])";
+    fn text(v: Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Option<IfEnv>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str(EXPECTING)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some((k, v)) = m.next_entry::<String, Value>()? {
+                let patterns = match v {
+                    Value::Sequence(items) if !items.is_empty() => items.into_iter().map(text).collect::<Option<Vec<_>>>(),
+                    v => text(v).map(|p| vec![p]),
+                };
+                out.push((k, patterns.ok_or_else(|| A::Error::custom(EXPECTING))?));
+            }
+            Ok(Some(out))
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// `pattern`（`*` と `?` が使える）が `text` の全体に合うか．
+fn glob(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut i, mut j) = (0, 0);
+    // 最後に見た `*` の位置と，そのとき text のどこまで進んでいたか（合わなければここに戻る）
+    let mut star: Option<(usize, usize)> = None;
+    while j < t.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == t[j]) && p[i] != '*' {
+            (i, j) = (i + 1, j + 1);
+        } else if i < p.len() && p[i] == '*' {
+            star = Some((i, j));
+            i += 1;
+        } else if let Some((si, sj)) = star {
+            (i, j) = (si + 1, sj + 1);
+            star = Some((si, sj + 1));
+        } else {
+            return false;
+        }
+    }
+    p[i..].iter().all(|&c| c == '*')
+}
+
+/// 条件が成り立つか．`value` は変数の値を返す（設定されていなければ空文字列）．
+fn holds(cond: &IfEnv, value: impl Fn(&str) -> String) -> bool {
+    cond.iter().all(|(name, patterns)| {
+        let v = value(name);
+        patterns.iter().any(|p| glob(p, &v))
+    })
+}
+
+/// 条件を 1 行で表す（`RVIZ=1 MODE=a|b`）．
+fn describe(cond: &IfEnv) -> String {
+    cond.iter().map(|(k, ps)| format!("{k}={}", ps.join("|"))).collect::<Vec<_>>().join(" ")
+}
+
+/// `env` を書いた順に設定したとき，`names` の変数がどんな値になるかをシェルで確かめる．
+/// env の値はシェルが展開する（`${VAR:-x}` や `$(cmd)`）ので，ペインと同じく `$SHELL -c` で調べる．
+/// 設定されていない変数は空文字列になる．
+fn env_values(env: &Env, cwd: Option<&Path>, names: &[String]) -> Result<Vec<String>> {
+    let mut script = String::new();
+    for (k, v) in env {
+        script.push_str(&format!("export {k}=\"{v}\"\n"));
+    }
+    script.push_str("printf '%s\\0'");
+    for name in names {
+        script.push_str(&format!(" \"${{{name}-}}\""));
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(["-c", &script]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let out = cmd.output().with_context(|| format!("cannot run {shell} to read the environment for if_env"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut values: Vec<String> = text.split('\0').map(String::from).collect();
+    values.pop(); // 最後の区切りの後ろ
+    if !out.status.success() || values.len() != names.len() {
+        bail!("cannot read the environment for if_env ({shell} failed while setting env)");
+    }
+    Ok(values)
 }
 
 /// shouji.yaml に書いた，すべてのタスクに共通の設定．
@@ -235,7 +345,13 @@ struct RawWindow {
 #[serde(deny_unknown_fields)]
 struct RawProgram {
     name: String,
-    command: String,
+    /// 実行するコマンド．`commands` とどちらか一方を書く．
+    command: Option<String>,
+    /// 条件ごとのコマンド．上から見て，最初に if_env が合ったものを実行する．
+    commands: Option<Vec<RawChoice>>,
+    /// 起動する条件．合わなければペインを作らない．
+    #[serde(default, deserialize_with = "if_env")]
+    if_env: Option<IfEnv>,
     pre_command: Option<String>,
     cwd: Option<String>,
     #[serde(default, deserialize_with = "ordered_env")]
@@ -249,6 +365,17 @@ struct RawProgram {
     delay: Option<f64>,
     restart: Option<RawRestart>,
     log: Option<String>,
+    stop: Option<RawStop>,
+}
+
+/// `commands` の 1 項目．if_env のない項目は「それ以外」で，最後にだけ書ける．
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChoice {
+    #[serde(default, deserialize_with = "if_env")]
+    if_env: Option<IfEnv>,
+    command: String,
+    /// このコマンドを選んだときの stop（省略時はプログラムの stop）．
     stop: Option<RawStop>,
 }
 
@@ -340,8 +467,13 @@ pub struct TaskWindow {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub name: String,
-    /// `$SHELL -c` で実行するコマンド．
+    /// `$SHELL -c` で実行するコマンド．`commands` で書いたプログラムでは，
+    /// `Task::apply_conditions` が選んだものに置き換える（それまでは最初の項目のもの）．
     pub command: String,
+    /// 起動する条件（空なら条件なし）．
+    pub if_env: IfEnv,
+    /// `commands` に書いた項目（`command` で書いたプログラムでは空）．
+    pub choices: Vec<Choice>,
     /// command の前に同じシェルで実行するコマンド（`source setup.bash` など）．
     /// 失敗したら command は実行しない．シェルを開くとき（autostart: false や s）にも実行する．
     pub pre_command: Option<String>,
@@ -373,7 +505,39 @@ pub struct Program {
     pub log: Option<PathBuf>,
 }
 
+/// `commands` の 1 項目．
+#[derive(Debug, Clone)]
+pub struct Choice {
+    /// 選ぶ条件（空なら「それ以外」）．
+    pub if_env: IfEnv,
+    pub command: String,
+    /// このコマンドを選んだときの stop と，待つ時間（`None` ならプログラムの stop のまま）．
+    pub stop: Option<(String, Duration)>,
+}
+
 impl Program {
+    /// 選択画面に出す 1 行: 条件と command．`commands` なら最初の項目と，残りの数．
+    pub fn summary(&self) -> String {
+        let line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut out = String::new();
+        if !self.if_env.is_empty() {
+            out.push_str(&format!("[if {}] ", describe(&self.if_env)));
+        }
+        match self.choices.split_first() {
+            None => out.push_str(&line(&self.command)),
+            Some((first, rest)) => {
+                if !first.if_env.is_empty() {
+                    out.push_str(&format!("[if {}] ", describe(&first.if_env)));
+                }
+                out.push_str(&line(&first.command));
+                if !rest.is_empty() {
+                    out.push_str(&format!(" (+{} more)", rest.len()));
+                }
+            }
+        }
+        out
+    }
+
     /// 起動を待つ必要があるか．
     pub fn waits(&self) -> bool {
         !self.after.is_empty() || !self.delay.is_zero()
@@ -489,18 +653,60 @@ impl Task {
                 Some(RawRestart::Full(f)) => (f.when, f.delay, f.max),
             };
             let restart_delay = secs("restart.delay", restart_delay, 1.0)?;
-            let (stop, stop_timeout) = match &p.stop {
-                None => (None, None),
-                Some(RawStop::Command(c)) => (Some(c.clone()), None),
-                Some(RawStop::Full(f)) => (Some(f.command.clone()), f.timeout),
+            let parse_stop = |stop: &Option<RawStop>| -> Result<(Option<String>, Duration)> {
+                let (command, timeout) = match stop {
+                    None => (None, None),
+                    Some(RawStop::Command(c)) => (Some(c.clone()), None),
+                    Some(RawStop::Full(f)) => (Some(f.command.clone()), f.timeout),
+                };
+                Ok((command.filter(|c| !c.trim().is_empty()), secs("stop.timeout", timeout, 10.0)?))
             };
-            let stop_timeout = secs("stop.timeout", stop_timeout, 10.0)?;
+            let (stop, stop_timeout) = parse_stop(&p.stop)?;
+            let check_cond = |cond: &IfEnv| -> Result<()> {
+                if cond.is_empty() {
+                    bail!("{}: if_env needs at least one NAME: value", p.name);
+                }
+                match cond.iter().find(|(k, _)| !valid_env_name(k)) {
+                    Some((k, _)) => bail!("{}: {k:?} cannot be an environment variable name (in if_env)", p.name),
+                    None => Ok(()),
+                }
+            };
+            let if_env = p.if_env.clone().unwrap_or_default();
+            if p.if_env.is_some() {
+                check_cond(&if_env)?;
+            }
+            let (command, choices) = match (&p.command, &p.commands) {
+                (Some(c), None) => (c.clone(), Vec::new()),
+                (None, Some(raw)) => {
+                    let mut choices = Vec::with_capacity(raw.len());
+                    for (i, c) in raw.iter().enumerate() {
+                        match &c.if_env {
+                            Some(cond) => check_cond(cond)?,
+                            None if i + 1 < raw.len() => {
+                                bail!("{}: in commands, only the last item can omit if_env (it is the fallback)", p.name)
+                            }
+                            None => {}
+                        }
+                        let stop = match parse_stop(&c.stop)? {
+                            (Some(command), timeout) => Some((command, timeout)),
+                            (None, _) => None,
+                        };
+                        choices.push(Choice { if_env: c.if_env.clone().unwrap_or_default(), command: c.command.clone(), stop });
+                    }
+                    let Some(first) = choices.first() else { bail!("{}: commands has no items", p.name) };
+                    (first.command.clone(), choices)
+                }
+                (Some(_), Some(_)) => bail!("{}: write either command or commands, not both", p.name),
+                (None, None) => bail!("{}: write command or commands", p.name),
+            };
             // log の相対パスは command と同じく作業ディレクトリから
             let cwd = p.cwd.as_ref().map(|c| resolve(c, base));
             let log_base = cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
             programs.push(Program {
                 name: p.name.clone(),
-                command: p.command.clone(),
+                command,
+                if_env,
+                choices,
                 pre_command: p.pre_command.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from),
                 cwd,
                 env: p.env.clone(),
@@ -511,7 +717,7 @@ impl Task {
                 restart,
                 restart_delay,
                 max_restarts,
-                stop: stop.filter(|c| !c.trim().is_empty()),
+                stop,
                 stop_timeout,
                 log: p.log.as_ref().map(|l| resolve(l, &log_base)),
             });
@@ -565,6 +771,68 @@ impl Task {
                 p.after.retain(|&(dep, _)| selected(dep));
             }
         }
+    }
+}
+
+impl Task {
+    /// if_env と commands を，いまの環境変数（shouji の環境に env を重ねたもの）で決める．
+    /// 条件に合わないプログラムは起動する対象から外し（それを待つ after も外す），その名前を返す．
+    /// commands のプログラムは，選んだ項目の command（と stop）に置き換える．
+    /// pre_command は実行しないので，pre_command が作る変数は条件に使えない．
+    pub fn apply_conditions(&mut self) -> Result<Vec<String>> {
+        let mut keep = vec![false; self.programs.len()];
+        for w in &self.windows {
+            w.programs.iter().for_each(|&k| keep[k] = true);
+        }
+        // 条件に出てくる変数（タスク全体で 1 つの並びにし，env と cwd が同じプログラムは 1 回で調べる）
+        let mut names: Vec<String> = Vec::new();
+        for (k, p) in self.programs.iter().enumerate() {
+            let conds = std::iter::once(&p.if_env).chain(p.choices.iter().map(|c| &c.if_env));
+            for (name, _) in conds.flatten().filter(|_| keep[k]) {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen: Vec<(Env, Option<PathBuf>, Vec<String>)> = Vec::new();
+        let mut skipped = Vec::new();
+        for (k, p) in self.programs.iter_mut().enumerate() {
+            if !keep[k] || (p.if_env.is_empty() && p.choices.is_empty()) {
+                continue;
+            }
+            let values = match seen.iter().find(|(env, cwd, _)| *env == p.env && *cwd == p.cwd) {
+                Some((_, _, values)) => values.clone(),
+                None => {
+                    let values = env_values(&p.env, p.cwd.as_deref(), &names).with_context(|| p.name.clone())?;
+                    seen.push((p.env.clone(), p.cwd.clone(), values.clone()));
+                    values
+                }
+            };
+            let value = |name: &str| names.iter().position(|n| n == name).map(|i| values[i].clone()).unwrap_or_default();
+            let mut ok = holds(&p.if_env, value);
+            if ok && !p.choices.is_empty() {
+                match p.choices.iter().find(|c| holds(&c.if_env, value)).cloned() {
+                    Some(choice) => {
+                        p.command = choice.command;
+                        if let Some((stop, timeout)) = choice.stop {
+                            (p.stop, p.stop_timeout) = (Some(stop), timeout);
+                        }
+                    }
+                    None => ok = false,
+                }
+            }
+            if ok {
+                p.choices.clear();
+            } else {
+                keep[k] = false;
+                skipped.push(p.name.clone());
+            }
+        }
+        self.select_mask(&keep);
+        Ok(skipped)
     }
 }
 
@@ -797,6 +1065,74 @@ mod tests {
             .contains("cycle: a → b → a"));
         assert!(e("programs:\n  - name: a\n    command: x\n  - name: b\n    command: y\n    after:\n      - a: finished\n").contains("each after item must be"));
         assert!(e("programs:\n  - name: a\n    command: x\n    delay: -1\n").contains("delay must be a number of seconds"));
+    }
+
+    #[test]
+    fn glob_patterns() {
+        assert!(glob("1", "1") && !glob("1", "10") && !glob("1", ""));
+        assert!(glob("", "") && !glob("", "x"));
+        assert!(glob("*", "") && glob("*", "anything"));
+        assert!(glob("?*", "x") && glob("?*", "xyz") && !glob("?*", ""));
+        assert!(glob("sam3_*", "sam3_object") && !glob("sam3_*", "sam2_object"));
+        assert!(glob("*codex*", "my-codex-2") && glob("a*b*c", "aXbYbZc") && !glob("a*b*c", "aXbYbZ"));
+    }
+
+    #[test]
+    fn parse_if_env_and_commands() {
+        let t = task(
+            "programs:\n  - name: a\n    if_env: { RVIZ: 1, MODE: [fast, 'quick*'] }\n    command: x\n  - name: b\n    stop: s0\n    commands:\n      - if_env: { V3: '1' }\n        command: one\n        stop: { command: s1, timeout: 3 }\n      - command: two\n",
+        )
+        .unwrap();
+        // 数値も文字列として読む．値は 1 つでも並びでもよい
+        let a = &t.programs[0];
+        assert_eq!(a.if_env, vec![("RVIZ".to_string(), vec!["1".to_string()]), ("MODE".to_string(), vec!["fast".to_string(), "quick*".to_string()])]);
+        assert_eq!(a.summary(), "[if RVIZ=1 MODE=fast|quick*] x");
+        let b = &t.programs[1];
+        assert_eq!(b.choices.len(), 2);
+        assert_eq!(b.choices[0].stop, Some(("s1".to_string(), Duration::from_secs(3))));
+        assert!(b.choices[1].if_env.is_empty() && b.choices[1].stop.is_none());
+        assert_eq!(b.summary(), "[if V3=1] one (+1 more)");
+
+        let e = |y: &str| format!("{:#}", task(y).unwrap_err());
+        assert!(e("programs:\n  - name: a\n").contains("write command or commands"));
+        assert!(e("programs:\n  - name: a\n    command: x\n    commands: [{command: y}]\n").contains("not both"));
+        assert!(e("programs:\n  - name: a\n    commands: []\n").contains("commands has no items"));
+        assert!(e("programs:\n  - name: a\n    commands:\n      - command: x\n      - if_env: {A: 1}\n        command: y\n").contains("only the last item can omit if_env"));
+        assert!(e("programs:\n  - name: a\n    command: x\n    if_env: {}\n").contains("at least one"));
+        assert!(e("programs:\n  - name: a\n    command: x\n    if_env: {MY-VAR: 1}\n").contains("in if_env"));
+        assert!(e("programs:\n  - name: a\n    command: x\n    if_env: {A: {b: c}}\n").contains("if_env must be a map"));
+        assert!(e("programs:\n  - name: a\n    command: x\n    if_env: {A: []}\n").contains("if_env must be a map"));
+        assert!(e("programs:\n  - name: a\n    command: x\n    if_env: A\n").contains("if_env must be a map"));
+    }
+
+    #[test]
+    fn apply_conditions() {
+        // SHOUJI_T_* は設定されていない変数．env の既定値を展開した後の値で決まる
+        let yaml = "env: { ON: '${SHOUJI_T_ON:-1}', OFF: '${SHOUJI_T_OFF:-0}', MODE: '${SHOUJI_T_MODE:-codex}' }\nwindows:\n  - name: w1\n    programs:\n      - name: on\n        if_env: { ON: 1 }\n        command: x\n      - name: off\n        if_env: { OFF: 1 }\n        command: x\n      - name: both\n        if_env: { ON: 1, OFF: 1 }\n        command: x\n      - name: waits\n        command: x\n        after: [off, on]\n  - name: w2\n    programs:\n      - name: unset\n        if_env: { SHOUJI_T_NONE: '?*' }\n        command: x\n      - name: empty\n        if_env: { SHOUJI_T_NONE: '' }\n        command: x\n        env: { OFF: 1 }\n      - name: pick\n        stop: s0\n        commands:\n          - if_env: { MODE: vlm }\n            command: vlm\n          - if_env: { MODE: [sidecar, 'co*'], ON: 1 }\n            command: codex\n            stop: s1\n          - command: other\n      - name: none\n        commands:\n          - if_env: { MODE: vlm }\n            command: vlm\n      - name: gated\n        if_env: { OFF: 1 }\n        commands:\n          - command: x\n  - name: w3\n    programs:\n      - name: gone\n        if_env: { OFF: 1 }\n        command: x\n";
+        let mut t = task(yaml).unwrap();
+        // cwd は /proj（無い）になるので外す
+        t.programs.iter_mut().for_each(|p| p.cwd = None);
+        let skipped = t.apply_conditions().unwrap();
+        assert_eq!(skipped, ["off", "both", "unset", "none", "gated", "gone"]);
+        // 合わないものはウィンドウから外れ，すべて外れたウィンドウは無くなる
+        let shape: Vec<String> = t.windows.iter().map(|w| format!("{}:{:?}", w.name, w.programs)).collect();
+        assert_eq!(shape, ["w1:[0, 3]", "w2:[5, 6]"]);
+        // 外れた off を待つ after は外れる
+        assert_eq!(t.programs[3].after, vec![(0, Cond::Started)]);
+        // 上から最初に合った項目の command と stop になる
+        let pick = &t.programs[6];
+        assert_eq!((pick.command.as_str(), pick.stop.as_deref(), pick.choices.len()), ("codex", Some("s1"), 0));
+
+        // どれにも合わなければ「それ以外」．stop はプログラムのもの
+        let mut t = task("env: { MODE: zzz }\nprograms:\n  - name: pick\n    stop: s0\n    commands:\n      - if_env: { MODE: vlm }\n        command: vlm\n        stop: s1\n      - command: other\n").unwrap();
+        assert!(t.apply_conditions().unwrap().is_empty());
+        assert_eq!((t.programs[0].command.as_str(), t.programs[0].stop.as_deref()), ("other", Some("s0")));
+
+        // 名前で選ばなかったプログラムは調べない（報告もしない）
+        let mut t = task(yaml).unwrap();
+        t.programs.iter_mut().for_each(|p| p.cwd = None);
+        t.select(&["on".to_string(), "off".to_string()]).unwrap();
+        assert_eq!(t.apply_conditions().unwrap(), ["off"]);
     }
 
     #[test]
