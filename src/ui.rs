@@ -1,11 +1,14 @@
 //! 画面の組み立て（tui_mock のデザイン）．
 //!
 //! ```text
-//!    1  app ●     2  tools                   Tasks    + Window    Split │    Split ─    ? Help
+//!  ▣ task ●   ▣ ros                         Tasks    + Window    Split │    Split ─    ? Help
+//!    1  app ●     2  tools
 //! ──────────────────────────────────────────────────────────────────────────────────────────
 //! ┌ Layout ──────┐ ╭─ build  cargo build ─────── pid 42  ● Running  Stop ─╮
-//! │ 1 app        │ │ ...                                                   │
-//! │   ├ build  ● │ ╰───────────────────────────────────────────────────────╯
+//! │ ▾ task       │ │ ...                                                   │
+//! │   1 app      │ │                                                       │
+//! │     ├ build ●│ ╰───────────────────────────────────────────────────────╯
+//! │ ▸ ros      ● │
 //! │ ● running    │
 //!  What you type goes to "build". Click another pane to switch.
 //!  C-q z Zoom  C-q q Close pane  C-q [ Scroll back  C-q t Hide layout  C-q ? Help  C-q d Leave
@@ -168,9 +171,47 @@ fn exit_text(what: &str) -> String {
 }
 
 impl App {
-    /// タブバーの行数（下に区切り線を引く．背が低い端末では 1 行だけ）．
+    /// タブバーの行数（上の段にグループ，下にウィンドウのタブ，その下に区切り線．
+    /// 背が低い端末では区切り線を省き，さらに低ければウィンドウのタブだけにする）．
     fn tab_rows(&self) -> u16 {
-        if self.size.1 >= 16 { 2 } else { 1 }
+        match self.size.1 {
+            16.. => 3,
+            8.. => 2,
+            _ => 1,
+        }
+    }
+
+    /// グループの段を出すか（出すなら 0 行目）．
+    fn show_groups(&self) -> bool {
+        self.tab_rows() >= 2
+    }
+
+    /// ウィンドウのタブの行．
+    fn tabs_y(&self) -> u16 {
+        if self.show_groups() { 1 } else { 0 }
+    }
+
+    /// ウィンドウ `wi` に，失敗して止まったペインがあるか．
+    fn window_failed(&self, wi: usize) -> bool {
+        self.windows[wi]
+            .root
+            .as_ref()
+            .is_some_and(|r| r.ids().iter().any(|id| self.panes.get(id).is_some_and(|p| p.is_dead() && p.last_exit.as_ref().is_some_and(|e| !e.0))))
+    }
+
+    /// グループ全体の状態の色（たたんだときに出す）．止まったもの → 待機中 → 動作中 → シェル → 終了の順に優先する．
+    fn group_color(&self, gi: usize) -> Color {
+        let order = [RED, AMBER, GREEN, BLUE, FAINT];
+        let mut best = order.len() - 1;
+        for wi in self.group_windows(gi) {
+            for id in self.windows[wi].ids() {
+                if let Some(p) = self.panes.get(&id) {
+                    let (_, c) = self.pane_status(id, p);
+                    best = best.min(order.iter().position(|o| *o == c).unwrap_or(best));
+                }
+            }
+        }
+        order[best]
     }
 
     fn footer_rows(&self) -> u16 {
@@ -271,26 +312,55 @@ impl App {
 
     fn tab_bar(&self) -> Vec<Part> {
         let (w, _) = self.size;
-        let mut row = Row::new(1, 0, w);
-        for (i, win) in self.windows.iter().enumerate() {
+        let cur_group = self.cur_group();
+        let mut parts = Vec::new();
+
+        // 上の段: グループ（起動したタスク）．押すとそのグループへ切り替える
+        let mut left_end = 0;
+        if self.show_groups() {
+            let mut row = Row::new(1, 0, w);
+            for (gi, g) in self.groups.iter().enumerate() {
+                let cur = gi == cur_group;
+                let (fg, bg) = if cur { (TEXT, BUTTON) } else { (DIM, PANEL) };
+                let c = Some(Click::Group(gi));
+                let failed = self.group_windows(gi).any(|wi| self.window_failed(wi));
+                row.push(" ▣ ".into(), style(if cur { AMBER } else { FAINT }, bg), c);
+                row.push(format!("{} ", g.name), if cur { bold(fg, bg) } else { style(fg, bg) }, c);
+                if failed {
+                    row.push("● ".into(), style(RED, bg), c);
+                }
+                row.text("  ", style(TEXT, PANEL));
+            }
+            left_end = row.x;
+            parts.extend(row.parts);
+        }
+
+        // ウィンドウのタブ（表示中のグループのものだけ．番号はグループの中で数える）
+        let mut row = Row::new(1, self.tabs_y(), w);
+        if !self.show_groups() {
+            // グループの段が無いときは，タブの頭にグループ名を出す
+            row.text(format!("{} ›  ", self.groups[cur_group].name), style(DIM, PANEL));
+        }
+        let range = self.group_windows(cur_group);
+        let start = range.start;
+        for i in range {
+            let win = &self.windows[i];
             let cur = i == self.current;
             let bg = if cur { AMBER } else { PANEL };
             let fg = if cur { BG } else { MUTED };
-            let failed = win
-                .root
-                .as_ref()
-                .is_some_and(|r| r.ids().iter().any(|id| self.panes.get(id).is_some_and(|p| p.is_dead() && p.last_exit.as_ref().is_some_and(|e| !e.0))));
             // タブの中は左右 2 文字ずつ空け，タブどうしは 2 文字離す
-            row.push(format!("  {} ", i + 1), style(fg, bg), Some(Click::Window(i)));
+            row.push(format!("  {} ", i - start + 1), style(fg, bg), Some(Click::Window(i)));
             row.push(format!(" {} ", win.name), bold(fg, bg), Some(Click::Window(i)));
-            if failed {
+            if self.window_failed(i) {
                 row.push("● ".into(), style(if cur { BG } else { RED }, bg), Some(Click::Window(i)));
             }
             row.push(" ".into(), style(fg, bg), Some(Click::Window(i)));
             row.text("  ", style(TEXT, PANEL));
         }
-        let left_end = row.x;
-        let mut parts = row.parts;
+        if !self.show_groups() {
+            left_end = row.x;
+        }
+        parts.extend(row.parts);
 
         // 右寄せ: マウス用のボタンと Help．入りきらなければ Help 以外を後ろから省く
         let mut buttons: Vec<(&str, Click)> = Vec::new();
@@ -336,32 +406,61 @@ impl App {
         let legend_top = bottom.saturating_sub(LEGEND.len() as u16 + 1);
         let tree_end = if legend_top > y + 2 { legend_top } else { bottom };
 
-        'tree: for (wi, win) in self.windows.iter().enumerate() {
+        let cur_group = self.cur_group();
+        'tree: for (gi, g) in self.groups.iter().enumerate() {
             if y >= tree_end {
                 break;
             }
-            let cur = wi == self.current;
-            let (fg, bg) = if cur { (AMBER, SEL_BG) } else { (TEXT, SIDEBAR) };
-            let text = format!(" {}  {}", wi + 1, win.name);
-            parts.push(Part::new(0, y, format!("{text:<width$}", width = end as usize), bold(fg, bg), end).click(Click::Window(wi)));
+            // グループの見出し: 押すとたたむ・広げる．たたんでいるときは全体の状態の ● を出す
+            let range = self.group_windows(gi);
+            let fg = if gi == cur_group { AMBER } else { TEXT };
+            let arrow = if g.collapsed { "▸" } else { "▾" };
+            let label = format!(" {arrow} {}", g.name);
+            let label = if g.collapsed {
+                let n = format!(" {}w", range.len());
+                let label = truncate(&label, (end as usize).saturating_sub(4 + n.width()));
+                format!("{label}{n}")
+            } else {
+                truncate(&label, end as usize - 1)
+            };
+            let click = Click::ToggleGroup(gi);
+            parts.push(Part::new(0, y, format!("{label:<width$}", width = end as usize), bold(fg, SIDEBAR), end).click(click));
+            if g.collapsed {
+                parts.push(Part::new(end - 2, y, "●", style(self.group_color(gi), SIDEBAR), end).click(click));
+            }
             y += 1;
-            let ids = win.root.as_ref().map(|r| r.ids()).unwrap_or_default();
-            for (k, id) in ids.iter().enumerate() {
+            if g.collapsed {
+                continue;
+            }
+            let start = range.start;
+            for wi in range {
                 if y >= tree_end {
                     break 'tree;
                 }
-                let Some(pane) = self.panes.get(id) else { continue };
-                let selected = cur && *id == win.active;
-                let bg = if selected { AMBER_BG } else if cur { SEL_BG } else { SIDEBAR };
-                let fg = if selected { TEXT } else { MUTED };
-                let branch = if k + 1 == ids.len() { "└" } else { "├" };
-                let name = pane.program().map_or("shell", |p| p.name.as_str());
-                let label = format!("   {branch} {name}");
-                let label = crate::ui::truncate(&label, end as usize - 3);
-                parts.push(Part::new(0, y, format!("{label:<width$}", width = end as usize), style(fg, bg), end).click(Click::Pane(wi, *id)));
-                let (_, color) = self.pane_status(*id, pane);
-                parts.push(Part::new(end - 2, y, "●", style(color, bg), end).click(Click::Pane(wi, *id)));
+                let win = &self.windows[wi];
+                let cur = wi == self.current;
+                let (fg, bg) = if cur { (AMBER, SEL_BG) } else { (TEXT, SIDEBAR) };
+                let text = truncate(&format!("   {}  {}", wi - start + 1, win.name), end as usize);
+                parts.push(Part::new(0, y, format!("{text:<width$}", width = end as usize), bold(fg, bg), end).click(Click::Window(wi)));
                 y += 1;
+                let ids = win.ids();
+                for (k, id) in ids.iter().enumerate() {
+                    if y >= tree_end {
+                        break 'tree;
+                    }
+                    let Some(pane) = self.panes.get(id) else { continue };
+                    let selected = cur && *id == win.active;
+                    let bg = if selected { AMBER_BG } else if cur { SEL_BG } else { SIDEBAR };
+                    let fg = if selected { TEXT } else { MUTED };
+                    let branch = if k + 1 == ids.len() { "└" } else { "├" };
+                    let name = pane.program().map_or("shell", |p| p.name.as_str());
+                    let label = format!("     {branch} {name}");
+                    let label = truncate(&label, end as usize - 3);
+                    parts.push(Part::new(0, y, format!("{label:<width$}", width = end as usize), style(fg, bg), end).click(Click::Pane(wi, *id)));
+                    let (_, color) = self.pane_status(*id, pane);
+                    parts.push(Part::new(end - 2, y, "●", style(color, bg), end).click(Click::Pane(wi, *id)));
+                    y += 1;
+                }
             }
         }
         if tree_end == legend_top {
@@ -569,9 +668,11 @@ impl App {
 
         // タブバー（と下の区切り線）と下部の背景
         for x in 0..w {
-            frame.set(x, 0, " ", style(TEXT, PANEL));
-            if self.tab_rows() == 2 {
-                frame.set(x, 1, "─", style(LINE, BG));
+            for y in 0..self.tab_rows().min(2) {
+                frame.set(x, y, " ", style(TEXT, PANEL));
+            }
+            if self.tab_rows() == 3 {
+                frame.set(x, 2, "─", style(LINE, BG));
             }
             for k in 0..self.footer_rows() {
                 frame.set(x, h.saturating_sub(1 + k), " ", style(TEXT, PANEL));

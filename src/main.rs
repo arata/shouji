@@ -111,6 +111,8 @@ impl Drop for TerminalGuard {
 struct Window {
     /// ステータスバーに出す名前（シェルなら "shell"，ランチャーからならプログラム名）．
     name: String,
+    /// 属するグループの番号（[`Group::id`]）．
+    group: u64,
     root: Option<Node>,
     active: PaneId,
     /// 直近のレイアウト結果（表示順）．各ペインの中身の領域（タイトル行を除く）．
@@ -124,8 +126,8 @@ struct Window {
 }
 
 impl Window {
-    fn new(name: String, pane: PaneId) -> Self {
-        Self { name, root: Some(Node::Leaf(pane)), active: pane, rects: Vec::new(), titles: Vec::new(), boxes: Vec::new(), zoom: false }
+    fn new(name: String, group: u64, pane: PaneId) -> Self {
+        Self { name, group, root: Some(Node::Leaf(pane)), active: pane, rects: Vec::new(), titles: Vec::new(), boxes: Vec::new(), zoom: false }
     }
 
     fn rect_of(&self, id: PaneId) -> Option<Rect> {
@@ -220,6 +222,17 @@ impl Window {
     }
 }
 
+/// ウィンドウのグループ（起動したタスク 1 つ分．タブバーの上の段とサイドバーに出す）．
+/// 同じグループのウィンドウは `App::windows` の中で続けて並べ，グループの順もこの並びと同じにする．
+struct Group {
+    id: u64,
+    name: String,
+    /// サイドバーでたたんでいるか．
+    collapsed: bool,
+    /// 最後に表示していたウィンドウ（グループの中での位置）．グループを切り替えたときに戻る．
+    last: usize,
+}
+
 /// stop を実行して，プログラムが終わるのを待っているところ．
 struct Stopping {
     /// stop のプロセス（終わったら `None`．そのあともプログラムが終わるのを deadline まで待つ）．
@@ -234,6 +247,10 @@ struct Stopping {
 #[derive(Clone, Copy, Debug)]
 enum Click {
     Window(usize),
+    /// タブバーの上の段のグループ（そのグループへ切り替える）．
+    Group(usize),
+    /// サイドバーのグループの見出し（たたむ・広げる）．
+    ToggleGroup(usize),
     /// サイドバーのペイン（ウィンドウ, ペイン）．
     Pane(usize, PaneId),
     /// ペインの中のボタン（ペイン, 押したことにするキー）．
@@ -252,6 +269,9 @@ struct App {
     /// 全ウィンドウのペイン．
     panes: HashMap<PaneId, Pane>,
     windows: Vec<Window>,
+    /// ウィンドウのグループ（並びは windows と同じ順）．
+    groups: Vec<Group>,
+    next_group: u64,
     /// 表示中のウィンドウの添字．
     current: usize,
     next_id: PaneId,
@@ -317,6 +337,8 @@ impl App {
         let mut app = Self {
             panes: HashMap::new(),
             windows: Vec::new(),
+            groups: Vec::new(),
+            next_group: 0,
             current: 0,
             next_id: 0,
             size,
@@ -367,17 +389,78 @@ impl App {
         &mut self.windows[self.current]
     }
 
-    /// シェルを 1 つ持つウィンドウを末尾に作り，そこへ切り替える．
+    // ---- グループ ----
+
+    /// 末尾に新しいグループを作る．同じ名前のグループがあれば "name (2)" のように番号を付ける．
+    fn add_group(&mut self, name: &str) -> u64 {
+        let mut label = name.to_string();
+        let mut n = 1;
+        while self.groups.iter().any(|g| g.name == label) {
+            n += 1;
+            label = format!("{name} ({n})");
+        }
+        let id = self.next_group;
+        self.next_group += 1;
+        self.groups.push(Group { id, name: label, collapsed: false, last: 0 });
+        id
+    }
+
+    /// ウィンドウ `wi` のグループの添字．
+    fn group_of(&self, wi: usize) -> usize {
+        let id = self.windows[wi].group;
+        self.groups.iter().position(|g| g.id == id).unwrap_or(0)
+    }
+
+    /// 表示中のグループの添字．
+    fn cur_group(&self) -> usize {
+        self.group_of(self.current)
+    }
+
+    /// グループ `gi` のウィンドウの範囲（windows の添字）．
+    fn group_windows(&self, gi: usize) -> std::ops::Range<usize> {
+        let Some(g) = self.groups.get(gi) else { return 0..0 };
+        let start = self.windows.iter().position(|w| w.group == g.id).unwrap_or(self.windows.len());
+        let len = self.windows[start..].iter().take_while(|w| w.group == g.id).count();
+        start..start + len
+    }
+
+    /// グループ `gi` の，最後に見ていたウィンドウへ切り替える．
+    fn select_group(&mut self, gi: usize) {
+        let range = self.group_windows(gi);
+        if range.is_empty() {
+            return;
+        }
+        self.stop_scrolling();
+        self.current = range.start + self.groups[gi].last.min(range.len() - 1);
+    }
+
+    /// 表示中のウィンドウを，そのグループの「最後に見ていたウィンドウ」として覚える．
+    fn remember_window(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let gi = self.cur_group();
+        let start = self.group_windows(gi).start;
+        self.groups[gi].last = self.current - start;
+    }
+
+    /// シェルを 1 つ持つウィンドウを，表示中のグループの末尾に作り，そこへ切り替える．
     fn new_window(&mut self) -> Result<()> {
         let area = self.pane_area();
         let id = self.next_id;
         let pane = Pane::spawn(id, area.h, area.w, None, self.tx.clone())?;
         self.next_id += 1;
         self.panes.insert(id, pane);
-        let mut win = Window::new("shell".into(), id);
+        let (group, at) = if self.windows.is_empty() {
+            (self.add_group("shell"), 0)
+        } else {
+            let gi = self.cur_group();
+            (self.groups[gi].id, self.group_windows(gi).end)
+        };
+        let mut win = Window::new("shell".into(), group, id);
         win.relayout(area, &mut self.panes);
-        self.windows.push(win);
-        self.current = self.windows.len() - 1;
+        self.windows.insert(at, win);
+        self.current = at;
         Ok(())
     }
 
@@ -412,9 +495,11 @@ impl App {
         let area = self.pane_area();
         let mut failed = Vec::new();
         let mut first_window = None;
+        // タスク 1 つを 1 つのグループにする（ウィンドウは末尾に足すので，グループも末尾）
+        let group = self.add_group(&task.name);
         for tw in &task.windows {
             let win_ids: Vec<PaneId> = tw.programs.iter().map(|&k| ids[k]).collect();
-            let mut win = Window::new(tw.name.clone(), win_ids[0]);
+            let mut win = Window::new(tw.name.clone(), group, win_ids[0]);
             win.root = Some(Node::tiled(&win_ids, Dir::Horizontal));
             // 先に配置を決め，各ペインをその大きさで起動する
             win.relayout(area, &mut self.panes);
@@ -452,6 +537,7 @@ impl App {
             first_window.get_or_insert(self.windows.len() - 1);
         }
         let Some(first) = first_window else {
+            self.groups.retain(|g| g.id != group);
             bail!("cannot start {}: {}", task.name, failed.join(", "));
         };
         // 表示するのはタスクの最初のウィンドウ
@@ -522,6 +608,7 @@ impl App {
             // クライアントとのやり取りはサーバーのループで扱う
             Event::Attach(..) | Event::ClientInput(..) | Event::ClientResize(..) | Event::ClientGone(_) | Event::Info(_) | Event::Kill => {}
         }
+        self.remember_window();
     }
 
     fn on_keys(&mut self, bytes: &[u8]) {
@@ -851,6 +938,12 @@ impl App {
                 self.current = i;
             }
             Click::Window(_) => {}
+            Click::Group(gi) => self.select_group(gi),
+            Click::ToggleGroup(gi) => {
+                if let Some(g) = self.groups.get_mut(gi) {
+                    g.collapsed = !g.collapsed;
+                }
+            }
             Click::Pane(i, id) if i < self.windows.len() => {
                 self.stop_scrolling();
                 self.current = i;
@@ -974,8 +1067,21 @@ impl App {
             Action::Help => self.help = Some(Help::default()),
             Action::NextWindow => self.current = (self.current + 1) % n,
             Action::PrevWindow => self.current = (self.current + n - 1) % n,
-            Action::SelectWindow(i) if i < n => self.current = i,
-            Action::SelectWindow(_) => {}
+            // 番号は表示中のグループの中で数える
+            Action::SelectWindow(i) => {
+                let range = self.group_windows(self.cur_group());
+                if i < range.len() {
+                    self.current = range.start + i;
+                }
+            }
+            Action::NextGroup => {
+                let (g, len) = (self.cur_group(), self.groups.len());
+                self.select_group((g + 1) % len);
+            }
+            Action::PrevGroup => {
+                let (g, len) = (self.cur_group(), self.groups.len());
+                self.select_group((g + len - 1) % len);
+            }
         }
     }
 
@@ -1375,8 +1481,11 @@ impl App {
         win.relayout(area, &mut self.panes);
 
         if win.rects.is_empty() {
-            // ウィンドウ最後のペインだったので，ウィンドウごと消す
-            self.windows.remove(wi);
+            // ウィンドウ最後のペインだったので，ウィンドウごと消す（グループも空になれば消す）
+            let group = self.windows.remove(wi).group;
+            if !self.windows.iter().any(|w| w.group == group) {
+                self.groups.retain(|g| g.id != group);
+            }
             if self.windows.is_empty() {
                 self.quit = true;
                 return;

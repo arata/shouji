@@ -27,9 +27,17 @@ const GROUPS: &[Group] = &[
         title: "Windows",
         items: &[
             ("Click a tab", "Switch window"),
-            ("C-q 1-9", "Go to window number N"),
+            ("C-q 1-9", "Window number N in this group"),
             ("C-q n / C-q p", "Next / previous window"),
-            ("C-q c", "New window"),
+            ("C-q c", "New window in this group"),
+        ],
+    },
+    Group {
+        title: "Groups (one per task)",
+        items: &[
+            ("Click a group", "Switch group (row above tabs)"),
+            ("C-q g / C-q G", "Next / previous group"),
+            ("Click ▾ / ▸", "Fold / unfold in the layout"),
         ],
     },
     Group {

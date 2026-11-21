@@ -133,6 +133,14 @@ A program left out is treated like one not selected: an `after` that waits for i
 Every option is described in `sample_config/task.yaml`. `sample_config/ros.yaml` is a ROS example,
 `sample_config/if_env.yaml` an `if_env` / `commands` example.
 
+### Groups
+
+Each task you start becomes a **group**. The row above the window tabs lists the groups, and the tabs
+show only the windows of the selected group, so you can tell which program belongs to which task.
+In the layout panel on the left, click a group's `▾` / `▸` line to fold or unfold it
+(a folded group shows one `●` for its overall state: red if any program stopped).
+New windows (`C-q c`, `+ Window`) join the current group. Starting the same task twice makes `task (2)`.
+
 ## Keys (prefix: `Ctrl-q`)
 
 What you type always goes to the selected pane. Most things can be done with the mouse
@@ -148,7 +156,8 @@ start with `Ctrl-q`: press `Ctrl-q`, let go, then press the key.
 | `C-q %` / `C-q "` | Split left/right, top/bottom |
 | `C-q q` | Close the pane |
 | `C-q s` | Run the program's `stop` command without closing the pane (also the `Stop` button) |
-| `C-q c` / `C-q n` / `C-q p` / `C-q 1-9` | New window / switch windows (or click a tab) |
+| `C-q c` / `C-q n` / `C-q p` / `C-q 1-9` | New window / switch windows (or click a tab). `1-9` count within the current group |
+| `C-q g` / `C-q G` | Next / previous group (or click a group in the row above the tabs) |
 | `C-q [` | Scroll back (`k/j u/d g/G`, `q` to stop; the mouse wheel works too) and copy (see below) |
 | `C-q ]` | Paste what you copied in shouji (also the middle mouse button) |
 | `C-q t` | Show / hide the layout panel |

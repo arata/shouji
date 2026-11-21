@@ -24,7 +24,11 @@ pub enum Action {
     NewWindow,
     NextWindow,
     PrevWindow,
+    /// 表示中のグループの N 番目のウィンドウ．
     SelectWindow(usize),
+    /// 次・前のグループ（起動したタスク）．
+    NextGroup,
+    PrevGroup,
     OpenLauncher,
     /// スクロールモード（過去の出力を見る）に入る．
     ScrollMode,
@@ -94,6 +98,8 @@ impl InputParser {
                     b' ' | 0x00 => actions.push(Action::OpenLauncher),
                     b'n' => actions.push(Action::NextWindow),
                     b'p' => actions.push(Action::PrevWindow),
+                    b'g' => actions.push(Action::NextGroup),
+                    b'G' => actions.push(Action::PrevGroup),
                     // ウィンドウ番号は 1 から（0 は 10 番目）
                     b'1'..=b'9' => actions.push(Action::SelectWindow((b - b'1') as usize)),
                     b'0' => actions.push(Action::SelectWindow(9)),
