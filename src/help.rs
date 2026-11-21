@@ -53,6 +53,18 @@ const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        title: "Copy and paste",
+        items: &[
+            ("Drag", "Copy the text"),
+            ("2 / 3 clicks", "Copy a word / a line"),
+            ("Shift+drag", "Your terminal's own selection"),
+            ("C-q [, v ... y", "Select with keys and copy"),
+            ("h l w b 0 $", "Move while selecting"),
+            ("V", "Select whole lines"),
+            ("C-q ], Middle", "Paste what you copied"),
+        ],
+    },
+    Group {
         title: "Programs",
         items: &[("C-q Space", "Task launcher: start programs"), ("Click Tasks", "The same, with the mouse")],
     },

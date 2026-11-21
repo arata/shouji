@@ -653,6 +653,8 @@ impl App {
             let Some(pane) = self.panes.get(id) else { continue };
             let parser = pane.parser.lock().unwrap();
             let screen = parser.screen();
+            let view = crate::select::View::of(&parser);
+            let selection = self.selection.filter(|s| s.pane == *id);
             for row in 0..r.h {
                 for col in 0..r.w {
                     let Some(cell) = screen.cell(row, col) else { continue };
@@ -662,6 +664,10 @@ impl App {
                     }
                     if s.bg == Color::Reset {
                         s.bg = PANEL;
+                    }
+                    // 選んでいる文字は色を反転して示す
+                    if selection.is_some_and(|sel| sel.contains(crate::select::Pos { row: view.abs(row), col })) {
+                        s.inverse = !s.inverse;
                     }
                     let text = if cell.is_wide_continuation() {
                         ""
@@ -680,10 +686,20 @@ impl App {
                     let (cr, cc) = screen.cursor_position();
                     cursor = Some((r.x + cc.min(r.w.saturating_sub(1)), r.y + cr.min(r.h.saturating_sub(1))));
                 }
+                // コピーモードのカーソル
+                if self.scrolling
+                    && let Some(c) = self.copy_cursor
+                    && let Some(cr) = view.visible(c.row)
+                    && cr < r.h
+                {
+                    cursor = Some((r.x + c.col.min(r.w.saturating_sub(1)), r.y + cr));
+                }
                 modes = Modes {
                     app_cursor: screen.application_cursor(),
                     app_keypad: screen.application_keypad(),
-                    bracketed_paste: screen.bracketed_paste(),
+                    // 貼り付けを常に印付きで受け取り，キーとして解釈しないようにする．
+                    // ペインへは，そのプログラムが使っていれば印を付けて送る（paste.rs）
+                    bracketed_paste: true,
                     mouse: false,
                 };
             }

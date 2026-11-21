@@ -42,6 +42,8 @@ pub const DETACHED: u8 = 11;
 pub const EXIT: u8 = 12;
 /// INFO への返事（中身: 1 行の説明）．
 pub const INFO_REPLY: u8 = 13;
+/// クリップボードに入れる文字列（中身: UTF-8）．クライアントが自分の端末へ OSC 52 で書く．
+pub const CLIPBOARD: u8 = 14;
 
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     let mut buf = Vec::with_capacity(payload.len() + 5);
@@ -242,11 +244,19 @@ pub fn attach(name: &str) -> Result<End> {
 
     // サーバーの描画 → 端末
     let mut out = io::stdout();
+    let in_tmux = std::env::var_os("TMUX").is_some();
     loop {
         match read_frame(&mut reader) {
             Ok(Some((OUTPUT, bytes))) => {
                 out.write_all(&bytes)?;
                 out.flush()?;
+            }
+            Ok(Some((CLIPBOARD, bytes))) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                out.write_all(&crate::clipboard::osc52(&text, in_tmux))?;
+                out.flush()?;
+                // OSC 52 を無視する端末（GNOME Terminal など）のため，xclip などにも渡す
+                crate::clipboard::copy_with_command(text);
             }
             Ok(Some((DETACHED, _))) => return Ok(End::Detached),
             Ok(Some((EXIT, _))) => return Ok(End::Exited),
