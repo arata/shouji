@@ -14,6 +14,7 @@ mod scroll;
 mod select;
 mod session;
 mod ui;
+mod update;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -84,6 +85,8 @@ pub enum Event {
     Info(UnixStream),
     /// `shouji kill`．
     Kill,
+    /// 新しいバージョンが出ている（ステータスバーに出す文）．
+    UpdateAvailable(String),
 }
 
 /// raw モードと代替画面を有効にし，drop 時に元へ戻す．
@@ -600,6 +603,7 @@ impl App {
                 }
             }
             Event::Output => {}
+            Event::UpdateAvailable(text) => self.info = Some(text),
             Event::Exited(id, generation) => self.on_exit(id, generation),
             Event::Resize(w, h) => {
                 self.size = (w.max(1), h.max(1));
@@ -1654,6 +1658,16 @@ fn run_server(name: &str, size: (u16, u16), opts: &Opts) -> Result<()> {
     {
         let tx = tx.clone();
         thread::spawn(move || accept_loop(listener, tx));
+    }
+
+    // 新しいバージョンが出ていないか裏で確かめる（起動を待たせない）
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            if let Some(text) = update::check() {
+                let _ = tx.send(Event::UpdateAvailable(text));
+            }
+        });
     }
 
     let mut app = App::new(tx, config, &startup, size)?;

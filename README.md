@@ -22,6 +22,9 @@ curl -fsSL .../install.sh | SHOUJI_INSTALL_DIR="$HOME/.local/bin" sh  # another 
 
 Or build it yourself: `cargo install --path .`
 
+When a session starts, shouji checks GitHub Releases in the background (with curl or wget) and
+shows a note in the status bar if a newer version is out. Set `SHOUJI_NO_UPDATE_CHECK=1` to turn this off.
+
 To make a release, push a tag: `git tag v0.1.0 && git push origin v0.1.0`.
 
 ## Usage
